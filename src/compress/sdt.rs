@@ -1,0 +1,600 @@
+//! Swinging-door trending (SDT) compression.
+//!
+//! The archive keeps an *anchor* `A` (the last archived point) and the points received since.
+//! For any point `Q` after `A`, the set of slopes from `A` whose line passes within `dev` of `Q`
+//! is
+//!
+//! ```text
+//! win(Q) = [ (Q.v - dev - A.v) / (Q.t - A.t),  (Q.v + dev - A.v) / (Q.t - A.t) ]
+//! ```
+//!
+//! Geometrically these are the two "doors" hinged at `A ± dev`; each new point can only swing
+//! them closed. Let `W` be the intersection of `win(Q)` over a set of points. Three archiving
+//! rules are implemented:
+//!
+//! * **Lookback (default).** `W` covers every point since `A`; a point `F` is *feasible* as a
+//!   segment end if `slope(A → F)` lies in the window of the points before it, i.e. the straight
+//!   line `A → F` passes within `dev` of each of them. When the doors cross at a new point `P`
+//!   (`W ∩ win(P) = ∅`), the **latest feasible** point is archived, and the points after it are
+//!   re-run from that new anchor. The bound holds by construction, archived values are original
+//!   measurements, and since the latest point before `P` is usually feasible, compression is
+//!   close to textbook SDT. The open segment is buffered (≤ [`LOOKBACK_CAP`] points; reaching
+//!   the cap ends the segment), and queries read the buffered points directly, so recent data
+//!   is exact until it is compressed.
+//! * **Strict.** O(1) state: `W` covers the points strictly between `A` and the held point `H`;
+//!   a new `P` replaces `H` only if `slope(A → P) ∈ W ∩ win(H)`, otherwise `H` is archived.
+//!   Same guarantee, no buffer, but noisy signals end segments early.
+//! * **Classic.** The textbook rule: keep `H` while the doors have not crossed, then archive the
+//!   measured `H`. Archiving `H` verbatim can violate the bound at intermediate points (see
+//!   `classic_mode_can_exceed_deviation`); kept only so benchmarks can quantify the trade.
+//!
+//! Discrete tags bypass the doors: a point is archived when its value or quality changes, which
+//! is exact under step reconstruction. Non-good points are archived on quality transitions only.
+
+use super::exceeds;
+use crate::encoding::varint::{put_uvarint, Cursor};
+use crate::error::{Error, Result};
+use crate::types::{Point, Quality, ValueKind};
+use std::collections::VecDeque;
+
+/// Maximum number of buffered points in an open lookback segment.
+pub const LOOKBACK_CAP: usize = 4096;
+
+/// Which archiving rule to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SdtMode {
+    /// Bounded error, measured values, near-textbook compression (default).
+    #[default]
+    Lookback,
+    /// Bounded error, measured values, O(1) state, lower compression.
+    Strict,
+    /// Textbook rule archiving measured values; can exceed the bound. Comparison only.
+    Classic,
+}
+
+impl SdtMode {
+    /// Compact wire code.
+    pub fn code(self) -> u8 {
+        match self {
+            SdtMode::Strict => 0,
+            SdtMode::Classic => 1,
+            SdtMode::Lookback => 2,
+        }
+    }
+
+    /// Inverse of [`SdtMode::code`].
+    pub fn from_code(c: u8) -> Option<SdtMode> {
+        match c {
+            0 => Some(SdtMode::Strict),
+            1 => Some(SdtMode::Classic),
+            2 => Some(SdtMode::Lookback),
+            _ => None,
+        }
+    }
+}
+
+/// Compression settings for one tag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SdtConfig {
+    /// Maximum reconstruction error in engineering units.
+    pub dev: f64,
+    /// End the open segment when the anchor is older than this (`None` = never).
+    pub max_ms: Option<i64>,
+    /// Archiving rule.
+    pub mode: SdtMode,
+}
+
+impl Default for SdtConfig {
+    fn default() -> Self {
+        SdtConfig { dev: 0.0, max_ms: Some(3_600_000), mode: SdtMode::Lookback }
+    }
+}
+
+/// Streaming SDT compressor for one tag. Serializable so the WAL checkpoint can persist it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sdt {
+    cfg: SdtConfig,
+    kind: ValueKind,
+    anchor: Option<Point>,
+    /// Held (latest) point for strict/classic/discrete.
+    held: Option<Point>,
+    /// Lookback: points received since the anchor (the open segment).
+    buf: Vec<Point>,
+    /// Lookback: index in `buf` of the latest feasible segment end.
+    feasible: usize,
+    lo: f64,
+    hi: f64,
+}
+
+fn window(anchor: Point, q: Point, dev: f64) -> (f64, f64) {
+    let dt = (q.ts - anchor.ts) as f64;
+    ((q.value - dev - anchor.value) / dt, (q.value + dev - anchor.value) / dt)
+}
+
+fn slope(a: Point, b: Point) -> f64 {
+    (b.value - a.value) / (b.ts - a.ts) as f64
+}
+
+impl Sdt {
+    /// New compressor.
+    pub fn new(cfg: SdtConfig, kind: ValueKind) -> Self {
+        Sdt {
+            cfg,
+            kind,
+            anchor: None,
+            held: None,
+            buf: Vec::new(),
+            feasible: 0,
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+        }
+    }
+
+    /// Settings in force.
+    pub fn config(&self) -> SdtConfig {
+        self.cfg
+    }
+
+    /// Replace the settings. Deviation and max-time changes apply to subsequent points; a mode
+    /// change first archives the open segment (returned) so states of two modes never mix.
+    pub fn set_config(&mut self, cfg: SdtConfig) -> Vec<Point> {
+        let mut out = Vec::new();
+        if cfg.mode != self.cfg.mode {
+            self.close(&mut out);
+        }
+        self.cfg = cfg;
+        out
+    }
+
+    /// Value kind of the tag.
+    pub fn kind(&self) -> ValueKind {
+        self.kind
+    }
+
+    /// The latest received, not-yet-archived point (PI calls this the snapshot).
+    pub fn snapshot(&self) -> Option<Point> {
+        self.buf.last().copied().or(self.held)
+    }
+
+    /// Every received point that is not archived yet, in time order. Queries append these to
+    /// the archived points; for lookback mode they are the exact open-segment samples.
+    pub fn pending(&self) -> Vec<Point> {
+        if self.buf.is_empty() {
+            self.held.into_iter().collect()
+        } else {
+            self.buf.clone()
+        }
+    }
+
+    /// The last archived point.
+    pub fn anchor(&self) -> Option<Point> {
+        self.anchor
+    }
+
+    fn reset_window(&mut self) {
+        self.lo = f64::NEG_INFINITY;
+        self.hi = f64::INFINITY;
+    }
+
+    fn archive(&mut self, p: Point, out: &mut Vec<Point>) {
+        out.push(p);
+        self.anchor = Some(p);
+        self.reset_window();
+    }
+
+    /// Archive whatever is open so that every received point is covered by the bound.
+    fn close(&mut self, out: &mut Vec<Point>) {
+        if let Some(h) = self.held.take() {
+            self.archive(h, out);
+        }
+        while !self.buf.is_empty() {
+            let rest = self.cut(out);
+            self.run_lookback(rest, out);
+        }
+    }
+
+    /// Lookback: archive the latest feasible point; return the buffered points after it.
+    fn cut(&mut self, out: &mut Vec<Point>) -> VecDeque<Point> {
+        let rest: VecDeque<Point> = self.buf.drain(self.feasible + 1..).collect();
+        let f = self.buf.pop().expect("feasible index is inside the buffer");
+        self.buf.clear();
+        self.feasible = 0;
+        self.archive(f, out);
+        rest
+    }
+
+    /// Lookback: feed points (front first) with the current anchor, cutting when doors cross.
+    fn run_lookback(&mut self, mut queue: VecDeque<Point>, out: &mut Vec<Point>) {
+        let dev = self.cfg.dev;
+        while let Some(p) = queue.pop_front() {
+            let a = self.anchor.expect("lookback runs with an anchor");
+            let (pl, ph) = window(a, p, dev);
+            if self.buf.is_empty() {
+                self.buf.push(p);
+                self.feasible = 0;
+                self.lo = pl;
+                self.hi = ph;
+                continue;
+            }
+            let (lo, hi) = (self.lo.max(pl), self.hi.min(ph));
+            let forced = self.cfg.max_ms.is_some_and(|m| p.ts - a.ts > m) || self.buf.len() >= LOOKBACK_CAP;
+            if forced || lo > hi {
+                queue.push_front(p);
+                let rest = self.cut(out);
+                for q in rest.into_iter().rev() {
+                    queue.push_front(q);
+                }
+                continue;
+            }
+            let s = slope(a, p);
+            if self.lo <= s && s <= self.hi {
+                self.feasible = self.buf.len();
+            }
+            self.lo = lo;
+            self.hi = hi;
+            self.buf.push(p);
+        }
+    }
+
+    /// Strict/classic: decide whether `p` may replace the held point.
+    fn offer_held(&mut self, anchor: Point, p: Point, out: &mut Vec<Point>) {
+        let Some(held) = self.held else {
+            self.held = Some(p);
+            return;
+        };
+        if self.cfg.max_ms.is_some_and(|m| p.ts - anchor.ts > m) {
+            self.close(out);
+            self.held = Some(p);
+            return;
+        }
+        let dev = self.cfg.dev;
+        let (hl, hh) = window(anchor, held, dev);
+        let (lo, hi, accept) = match self.cfg.mode {
+            SdtMode::Strict => {
+                let (lo, hi) = (self.lo.max(hl), self.hi.min(hh));
+                let s = slope(anchor, p);
+                (lo, hi, lo <= s && s <= hi)
+            }
+            _ => {
+                // Classic: the window covers H (unless H is the first point) and now P.
+                let (pl, ph) = window(anchor, p, dev);
+                let (lo, hi) = (self.lo.max(hl).max(pl), self.hi.min(hh).min(ph));
+                (lo, hi, lo <= hi)
+            }
+        };
+        if accept {
+            self.lo = lo;
+            self.hi = hi;
+        } else {
+            self.close(out);
+        }
+        self.held = Some(p);
+    }
+
+    /// Feed one point (timestamps must be strictly increasing; the archive enforces this).
+    /// Points that become archived are appended to `out` in time order.
+    pub fn offer(&mut self, p: Point, out: &mut Vec<Point>) {
+        let Some(anchor) = self.anchor else {
+            self.archive(p, out);
+            return;
+        };
+        // Non-good data: archive only quality transitions; a run of bad values is one point.
+        if !p.quality.is_good() {
+            self.close(out);
+            let last = self.anchor.unwrap_or(anchor);
+            if last.quality != p.quality {
+                self.archive(p, out);
+            }
+            return;
+        }
+        if !anchor.quality.is_good() || !p.value.is_finite() || !anchor.value.is_finite() {
+            self.close(out);
+            self.archive(p, out);
+            return;
+        }
+        if self.kind == ValueKind::Discrete {
+            let changed = exceeds(p.value, anchor.value, 0.0);
+            let timed_out = self.cfg.max_ms.is_some_and(|m| p.ts - anchor.ts > m);
+            if changed || timed_out {
+                // Under step reconstruction the held point carries no extra information.
+                self.held = None;
+                self.archive(p, out);
+            } else {
+                self.held = Some(p);
+            }
+            return;
+        }
+        match self.cfg.mode {
+            SdtMode::Lookback => self.run_lookback(VecDeque::from([p]), out),
+            SdtMode::Strict | SdtMode::Classic => self.offer_held(anchor, p, out),
+        }
+    }
+
+    /// Archive everything still open, e.g. at shutdown or before an export. Returns the points
+    /// archived by this call.
+    pub fn flush(&mut self) -> Vec<Point> {
+        let mut out = Vec::new();
+        self.close(&mut out);
+        out
+    }
+
+    /// Serialize the full state (config + doors + open segment) for a WAL checkpoint.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.cfg.dev.to_le_bytes());
+        out.extend_from_slice(&self.cfg.max_ms.unwrap_or(-1).to_le_bytes());
+        out.push(self.cfg.mode.code());
+        out.push(self.kind.code());
+        let put_point = |out: &mut Vec<u8>, p: &Point| {
+            out.extend_from_slice(&p.ts.to_le_bytes());
+            out.extend_from_slice(&p.value.to_le_bytes());
+            out.push(p.quality.code());
+        };
+        for p in [self.anchor, self.held] {
+            match p {
+                None => out.push(0),
+                Some(p) => {
+                    out.push(1);
+                    put_point(out, &p);
+                }
+            }
+        }
+        put_uvarint(out, self.buf.len() as u64);
+        for p in &self.buf {
+            put_point(out, p);
+        }
+        put_uvarint(out, self.feasible as u64);
+        out.extend_from_slice(&self.lo.to_le_bytes());
+        out.extend_from_slice(&self.hi.to_le_bytes());
+    }
+
+    /// Inverse of [`Sdt::encode`].
+    pub fn decode(c: &mut Cursor<'_>) -> Result<Sdt> {
+        let dev = c.f64()?;
+        let max = c.i64()?;
+        let mode = SdtMode::from_code(c.u8()?).ok_or_else(|| Error::Corrupt("bad sdt mode".into()))?;
+        let kind = ValueKind::from_code(c.u8()?).ok_or_else(|| Error::Corrupt("bad value kind".into()))?;
+        let point = |c: &mut Cursor<'_>| -> Result<Point> {
+            let ts = c.i64()?;
+            let value = c.f64()?;
+            let quality = Quality::from_code(c.u8()?).ok_or_else(|| Error::Corrupt("bad quality".into()))?;
+            Ok(Point { ts, value, quality })
+        };
+        let mut pts = [None, None];
+        for slot in pts.iter_mut() {
+            if c.u8()? == 1 {
+                *slot = Some(point(c)?);
+            }
+        }
+        let n = c.uvarint()? as usize;
+        if n > LOOKBACK_CAP {
+            return Err(Error::Corrupt("lookback buffer exceeds cap".into()));
+        }
+        let mut buf = Vec::with_capacity(n);
+        for _ in 0..n {
+            buf.push(point(c)?);
+        }
+        let feasible = c.uvarint()? as usize;
+        if feasible >= n.max(1) {
+            return Err(Error::Corrupt("feasible index outside buffer".into()));
+        }
+        let lo = c.f64()?;
+        let hi = c.f64()?;
+        Ok(Sdt {
+            cfg: SdtConfig { dev, max_ms: (max >= 0).then_some(max), mode },
+            kind,
+            anchor: pts[0],
+            held: pts[1],
+            buf,
+            feasible,
+            lo,
+            hi,
+        })
+    }
+}
+
+/// Compress a whole series in one call (used by benchmarks and tests).
+pub fn compress_series(cfg: SdtConfig, kind: ValueKind, pts: &[Point]) -> Vec<Point> {
+    let mut sdt = Sdt::new(cfg, kind);
+    let mut out = Vec::new();
+    for &p in pts {
+        sdt.offer(p, &mut out);
+    }
+    out.extend(sdt.flush());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::varint::Cursor;
+
+    fn strict(dev: f64) -> SdtConfig {
+        SdtConfig { dev, max_ms: None, mode: SdtMode::Strict }
+    }
+
+    fn lookback(dev: f64) -> SdtConfig {
+        SdtConfig { dev, max_ms: None, mode: SdtMode::Lookback }
+    }
+
+    fn lerp(a: Point, b: Point, t: i64) -> f64 {
+        a.value + (b.value - a.value) * (t - a.ts) as f64 / (b.ts - a.ts) as f64
+    }
+
+    fn max_error(orig: &[Point], arch: &[Point]) -> f64 {
+        let mut worst: f64 = 0.0;
+        for q in orig {
+            let i = arch.partition_point(|a| a.ts <= q.ts);
+            let v = if arch[i - 1].ts == q.ts { arch[i - 1].value } else { lerp(arch[i - 1], arch[i], q.ts) };
+            worst = worst.max((v - q.value).abs());
+        }
+        worst
+    }
+
+    #[test]
+    fn straight_line_compresses_to_endpoints() {
+        let pts: Vec<Point> = (0..100).map(|i| Point::good(i * 1000, 2.0 * i as f64)).collect();
+        let arch = compress_series(strict(0.01), ValueKind::Analog, &pts);
+        assert_eq!(arch.len(), 2);
+        assert_eq!(arch[0].ts, 0);
+        assert_eq!(arch[1].ts, 99_000);
+    }
+
+    #[test]
+    fn classic_mode_can_exceed_deviation() {
+        // A=(0,0), Q=(1,0), H=(10,10.5): the doors (dev=1) have not crossed, so classic SDT
+        // keeps H; but the line A→H passes 1.05 away from Q.
+        let pts = vec![Point::good(0, 0.0), Point::good(1, 0.0), Point::good(10, 10.5), Point::good(11, 30.0)];
+        let classic =
+            compress_series(SdtConfig { dev: 1.0, max_ms: None, mode: SdtMode::Classic }, ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &classic) > 1.0);
+        let strict_arch = compress_series(strict(1.0), ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &strict_arch) <= 1.0);
+        assert!(strict_arch.len() > classic.len());
+        // Lookback archives Q (the latest feasible end) instead of the infeasible H.
+        let lb = compress_series(lookback(1.0), ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &lb) <= 1.0);
+        assert!(lb.iter().any(|p| p.ts == 1));
+    }
+
+    #[test]
+    fn lookback_respects_bound_and_beats_strict_on_noisy_ramps() {
+        let mut r = crate::sim::rng::Rng::new(3);
+        let pts: Vec<Point> = (0..5000).map(|i| Point::good(i * 1000, i as f64 * 0.01 + r.normal() * 0.05)).collect();
+        let lb = compress_series(lookback(0.2), ValueKind::Analog, &pts);
+        let st = compress_series(strict(0.2), ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &lb) <= 0.2 + 1e-9);
+        assert!(lb.len() * 3 < st.len(), "lookback {} vs strict {}", lb.len(), st.len());
+        for a in &lb {
+            assert!(pts.iter().any(|p| p.ts == a.ts && p.value == a.value), "archived values are measurements");
+        }
+    }
+
+    #[test]
+    fn lookback_cap_and_max_time_end_segments() {
+        let pts: Vec<Point> = (0..(LOOKBACK_CAP as i64 + 10)).map(|i| Point::good(i, 1.0)).collect();
+        let mut s = Sdt::new(lookback(0.5), ValueKind::Analog);
+        let mut out = Vec::new();
+        for &p in &pts {
+            s.offer(p, &mut out);
+        }
+        assert!(out.len() >= 2, "a full buffer must end the segment");
+        assert!(s.pending().len() < LOOKBACK_CAP);
+        let timed = compress_series(
+            SdtConfig { dev: 0.5, max_ms: Some(100), mode: SdtMode::Lookback },
+            ValueKind::Analog,
+            &pts[..1000],
+        );
+        for w in timed.windows(2) {
+            assert!(w[1].ts - w[0].ts <= 101);
+        }
+    }
+
+    #[test]
+    fn noisy_ramp_respects_bound_and_compresses() {
+        let mut seed = 7u64;
+        let pts: Vec<Point> = (0..2000)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let noise = ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.2;
+                Point::good(i * 1000, (i as f64 * 0.01).sin() * 10.0 + noise)
+            })
+            .collect();
+        let arch = compress_series(strict(0.25), ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &arch) <= 0.25 + 1e-9);
+        let arch_lb = compress_series(lookback(0.25), ValueKind::Analog, &pts);
+        assert!(max_error(&pts, &arch_lb) <= 0.25 + 1e-9);
+        assert!(arch_lb.len() <= arch.len());
+        assert!(arch.len() * 5 < pts.len(), "ratio too low: {}", arch.len());
+    }
+
+    #[test]
+    fn bad_quality_runs_collapse_and_resume() {
+        let pts = vec![
+            Point::good(0, 1.0),
+            Point::good(1000, 1.1),
+            Point::with_quality(2000, f64::NAN, Quality::Bad),
+            Point::with_quality(3000, f64::NAN, Quality::Bad),
+            Point::with_quality(4000, 0.0, Quality::Stale),
+            Point::good(5000, 2.0),
+            Point::good(6000, 2.0),
+        ];
+        let arch = compress_series(strict(0.5), ValueKind::Analog, &pts);
+        let ts: Vec<i64> = arch.iter().map(|p| p.ts).collect();
+        assert_eq!(ts, vec![0, 1000, 2000, 4000, 5000, 6000]);
+    }
+
+    #[test]
+    fn non_finite_good_values_are_archived_verbatim() {
+        let pts =
+            vec![Point::good(0, 1.0), Point::good(1000, f64::INFINITY), Point::good(2000, 1.0), Point::good(3000, 1.0)];
+        let arch = compress_series(strict(0.5), ValueKind::Analog, &pts);
+        assert!(arch.iter().any(|p| p.value.is_infinite()));
+        assert_eq!(arch.last().unwrap().ts, 3000);
+    }
+
+    #[test]
+    fn discrete_archives_changes_only() {
+        let vals = [0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        let pts: Vec<Point> = vals.iter().enumerate().map(|(i, &v)| Point::good(i as i64, v)).collect();
+        let arch = compress_series(strict(10.0), ValueKind::Discrete, &pts);
+        let ts: Vec<i64> = arch.iter().map(|p| p.ts).collect();
+        // 0, change at 2, change at 5 (the flush has nothing left to add).
+        assert_eq!(ts, vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn max_time_forces_archive() {
+        let pts: Vec<Point> = (0..20).map(|i| Point::good(i * 1000, 3.0)).collect();
+        let arch =
+            compress_series(SdtConfig { dev: 1.0, max_ms: Some(5000), mode: SdtMode::Strict }, ValueKind::Analog, &pts);
+        for w in arch.windows(2) {
+            assert!(w[1].ts - w[0].ts <= 6000);
+        }
+        assert!(arch.len() >= 4);
+    }
+
+    #[test]
+    fn state_roundtrips_and_continues_identically() {
+        let pts: Vec<Point> = (0..500).map(|i| Point::good(i * 1000, ((i * i) % 97) as f64 / 10.0)).collect();
+        let cfg = SdtConfig { dev: 0.3, max_ms: Some(60_000), mode: SdtMode::Strict };
+        let mut a = Sdt::new(cfg, ValueKind::Analog);
+        let mut out_a = Vec::new();
+        for &p in &pts[..250] {
+            a.offer(p, &mut out_a);
+        }
+        let mut buf = Vec::new();
+        a.encode(&mut buf);
+        let mut b = Sdt::decode(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(a, b);
+        let mut out_b = out_a.clone();
+        for &p in &pts[250..] {
+            a.offer(p, &mut out_a);
+            b.offer(p, &mut out_b);
+        }
+        assert_eq!(out_a, out_b);
+        assert_eq!(a.snapshot(), b.snapshot());
+        assert!(Sdt::decode(&mut Cursor::new(&buf[..10])).is_err());
+    }
+
+    #[test]
+    fn accessors_and_config_updates() {
+        let mut s = Sdt::new(strict(1.0), ValueKind::Analog);
+        assert!(s.anchor().is_none());
+        assert_eq!(s.kind(), ValueKind::Analog);
+        assert!(s.set_config(strict(2.0)).is_empty());
+        assert_eq!(s.config().dev, 2.0);
+        let mut out = Vec::new();
+        s.offer(Point::good(0, 1.0), &mut out);
+        s.offer(Point::good(1, 1.5), &mut out);
+        assert_eq!(s.anchor().unwrap().ts, 0);
+        assert_eq!(s.snapshot().unwrap().ts, 1);
+        assert_eq!(s.flush().last().unwrap().ts, 1);
+        assert!(s.flush().is_empty());
+        // Switching mode with an open segment archives it first.
+        s.offer(Point::good(2, 1.7), &mut out);
+        let closed = s.set_config(lookback(2.0));
+        assert_eq!(closed.iter().map(|p| p.ts).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(s.config().mode, SdtMode::Lookback);
+    }
+}
