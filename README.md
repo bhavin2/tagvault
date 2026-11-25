@@ -1,7 +1,5 @@
 # tagvault
 
-[![CI](https://github.com/SlateGitOrg/tagvault/actions/workflows/ci.yml/badge.svg)](https://github.com/SlateGitOrg/tagvault/actions/workflows/ci.yml)
-
 A process historian for plant telemetry, written in Rust. It ingests **MQTT Sparkplug B**,
 reduces data with an exception deadband and a **swinging-door compressor whose error bound is
 proven and property-tested**, and stores the result in **Gorilla-encoded columnar chunks**
@@ -374,12 +372,3 @@ tests.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Maintainer
-
-Dev Bhatt maintains this project, drawing on experience building automated data pipelines,
-controls, and analytics. His work includes risk indicator tracking and reconciliation at scale,
-with a focus on reliable automation and operational reporting.
-
-- Email: [devbhattwork27@gmail.com](mailto:devbhattwork27@gmail.com)
-- LinkedIn: [linkedin.com/in/dev-bhatt27](https://linkedin.com/in/dev-bhatt27)
